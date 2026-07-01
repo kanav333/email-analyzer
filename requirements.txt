@@ -4,3 +4,4 @@ python-whois
 google-genai
 requests
 python-dotenv
+flask

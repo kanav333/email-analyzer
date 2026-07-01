@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Email Analyzer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Email Analyzer</h1>
+      <p>Upload a <code>.eml</code> file to check for phishing signals, header issues, and suspicious URLs.</p>
+    </header>
+
+    <form id="upload-form">
+      <label class="dropzone" id="dropzone" for="file-input">
+        <input type="file" id="file-input" accept=".eml" hidden>
+        <span class="dropzone-text">Drop your .eml file here or click to browse</span>
+        <span class="file-name" id="file-name"></span>
+      </label>
+      <button type="submit" id="analyze-btn" disabled>Analyze Email</button>
+    </form>
+
+    <div id="status" class="status hidden"></div>
+    <div id="results" class="results hidden"></div>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
