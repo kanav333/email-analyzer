@@ -1,0 +1,45 @@
+From: "PayPal Security Team" <security@paypa1-secure.ru>
+Reply-To: collect@phish-harvester.xyz
+To: you@gmail.com
+Subject: URGENT: Your PayPal account has been limited
+Date: Mon, 30 Jun 2026 08:23:11 +0000
+Message-ID: <x9k2m@paypa1-secure.ru>
+MIME-Version: 1.0
+Content-Type: text/html; charset=UTF-8
+Received-SPF: fail (domain of paypa1-secure.ru does not designate 185.220.101.45 as permitted sender)
+Authentication-Results: mx.google.com;
+   spf=fail (google.com: domain of paypa1-secure.ru does not designate 185.220.101.45 as permitted sender)
+   dkim=fail header.i=@paypa1-secure.ru
+
+<html>
+<body>
+<p>Dear Valued Customer,</p>
+
+<p>We have detected <strong>unusual activity</strong> on your PayPal account.
+Your account has been <strong>temporarily limited</strong> and will be
+<strong>permanently suspended within 24 hours</strong> unless you verify
+your identity immediately.</p>
+
+<p>Our security team at PayPal requires you to confirm your billing
+information and re-enter your credentials to restore full access.</p>
+
+<p>Failure to act will result in permanent account closure and loss of
+all funds.</p>
+
+<p>
+  <a href="http://paypa1-secure.ru/verify/account?token=abc123">
+    Click here to verify your account now
+  </a>
+</p>
+
+<p>
+  <a href="http://185.220.101.45/payload.exe">
+    Download security certificate (required)
+  </a>
+</p>
+
+<p>Regards,<br>
+PayPal Security Department<br>
+1-888-221-1161</p>
+</body>
+</html>

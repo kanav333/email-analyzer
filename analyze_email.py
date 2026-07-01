@@ -1,5 +1,9 @@
 import sys
+import os
 import re
+import json
+import base64
+import time
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
@@ -9,6 +13,12 @@ from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 import tldextract
 import whois
+import requests
+from google import genai
+from google.genai import types
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 SUSPICIOUS_BRANDS = [
@@ -233,7 +243,101 @@ def check_lookalike_domain(domain):
     return warnings
 
 
-def print_report(headers, auth_results, mismatch_result, urls, sender_domain, domain_age, lookalike_warnings):
+LLM_MODEL = "gemini-2.5-flash"
+
+LLM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "urgency_or_fear_tactics": {"type": "boolean"},
+        "impersonation": {"type": "boolean"},
+        "authority_pressure": {"type": "boolean"},
+        "requests_credentials_or_action": {"type": "boolean"},
+        "summary": {"type": "string"},
+    },
+    "required": [
+        "urgency_or_fear_tactics",
+        "impersonation",
+        "authority_pressure",
+        "requests_credentials_or_action",
+        "summary",
+    ],
+}
+
+
+def analyze_with_llm(subject, plain_text, html_text):
+    """Ask Gemini to flag social-engineering tactics in the email body."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+
+    if not api_key:
+        return None, "GEMINI_API_KEY not set; skipping LLM analysis."
+
+    body = plain_text
+    if not body and html_text:
+        body = BeautifulSoup(html_text, "html.parser").get_text()
+    body = (body or "").strip()[:8000]
+
+    prompt = (
+        "Analyze this email for phishing and social engineering tactics.\n\n"
+        f"Subject: {subject}\n\nBody:\n{body}"
+    )
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=LLM_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_json_schema=LLM_SCHEMA,
+            ),
+        )
+    except Exception as e:
+        return None, f"LLM analysis failed: {e}"
+
+    try:
+        return json.loads(response.text), None
+    except (json.JSONDecodeError, TypeError):
+        return None, "LLM analysis failed: could not parse response."
+
+
+VT_BASE_URL = "https://www.virustotal.com/api/v3"
+
+
+def check_url_virustotal(url, api_key):
+    """Look up a URL's VirusTotal verdict (free-tier v3 API)."""
+    url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
+    headers = {"x-apikey": api_key}
+
+    try:
+        resp = requests.get(f"{VT_BASE_URL}/urls/{url_id}", headers=headers, timeout=15)
+    except requests.RequestException as e:
+        return {"status": "error", "message": str(e)}
+
+    if resp.status_code == 200:
+        stats = resp.json()["data"]["attributes"]["last_analysis_stats"]
+        return {
+            "status": "found",
+            "malicious": stats.get("malicious", 0),
+            "suspicious": stats.get("suspicious", 0),
+            "total_engines": sum(stats.values()),
+        }
+
+    if resp.status_code == 404:
+        # No scan history yet — submit it for future analysis, don't block waiting.
+        try:
+            requests.post(f"{VT_BASE_URL}/urls", headers=headers, data={"url": url}, timeout=15)
+        except requests.RequestException:
+            pass
+        return {"status": "not_scanned"}
+
+    if resp.status_code == 429:
+        return {"status": "error", "message": "VirusTotal rate limit exceeded."}
+
+    return {"status": "error", "message": f"VirusTotal returned HTTP {resp.status_code}."}
+
+
+def print_report(headers, auth_results, mismatch_result, urls, sender_domain, domain_age, lookalike_warnings,
+                  llm_result, llm_error, url_reports):
     """Print a structured report."""
     print("=" * 60)
     print("EMAIL SECURITY ANALYSIS REPORT")
@@ -280,6 +384,31 @@ def print_report(headers, auth_results, mismatch_result, urls, sender_domain, do
     else:
         print("No URLs found.")
 
+    print("\n[LLM Analysis]")
+    if llm_error:
+        print(llm_error)
+    elif llm_result:
+        print(f"Urgency/Fear Tactics: {'YES' if llm_result['urgency_or_fear_tactics'] else 'NO'}")
+        print(f"Impersonation: {'YES' if llm_result['impersonation'] else 'NO'}")
+        print(f"Authority Pressure: {'YES' if llm_result['authority_pressure'] else 'NO'}")
+        print(f"Requests Credentials/Action: {'YES' if llm_result['requests_credentials_or_action'] else 'NO'}")
+        print(f"Summary: {llm_result['summary']}")
+
+    print("\n[VirusTotal URL Checks]")
+    if not url_reports:
+        print("No URLs to check.")
+    else:
+        for url, report in url_reports:
+            status = report["status"]
+            if status == "found":
+                print(f"- {url}: {report['malicious']}/{report['total_engines']} engines flagged malicious")
+            elif status == "not_scanned":
+                print(f"- {url}: not previously scanned by VirusTotal; submitted for analysis")
+            elif status == "skipped":
+                print(f"- {url}: skipped (VIRUSTOTAL_API_KEY not set)")
+            else:
+                print(f"- {url}: error - {report['message']}")
+
     print("\n[Quick Risk Notes]")
     risk_notes = []
 
@@ -300,6 +429,20 @@ def print_report(headers, auth_results, mismatch_result, urls, sender_domain, do
 
     if lookalike_warnings:
         risk_notes.append("Possible lookalike domain detected.")
+
+    if llm_result and any(
+        llm_result[flag]
+        for flag in (
+            "urgency_or_fear_tactics",
+            "impersonation",
+            "authority_pressure",
+            "requests_credentials_or_action",
+        )
+    ):
+        risk_notes.append("LLM detected social engineering tactics (see LLM Analysis).")
+
+    if any(report.get("malicious", 0) > 0 for _, report in url_reports):
+        risk_notes.append("VirusTotal flagged a malicious URL.")
 
     if risk_notes:
         for note in risk_notes:
@@ -351,6 +494,20 @@ def main():
 
     lookalike_warnings = check_lookalike_domain(registered_sender_domain)
 
+    llm_result, llm_error = analyze_with_llm(headers["Subject"], plain_text, html_text)
+
+    vt_api_key = os.environ.get("VIRUSTOTAL_API_KEY")
+    url_reports = []
+    if vt_api_key:
+        if len(urls) > 1:
+            print(f"Checking {len(urls)} URLs against VirusTotal (free-tier rate limit, ~16s between requests)...")
+        for i, url in enumerate(urls):
+            if i > 0:
+                time.sleep(16)
+            url_reports.append((url, check_url_virustotal(url, vt_api_key)))
+    else:
+        url_reports = [(url, {"status": "skipped"}) for url in urls]
+
     print_report(
         headers=headers,
         auth_results=auth_results,
@@ -358,7 +515,10 @@ def main():
         urls=urls,
         sender_domain=registered_sender_domain,
         domain_age=domain_age,
-        lookalike_warnings=lookalike_warnings
+        lookalike_warnings=lookalike_warnings,
+        llm_result=llm_result,
+        llm_error=llm_error,
+        url_reports=url_reports
     )
 
 
