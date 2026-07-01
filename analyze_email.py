@@ -336,80 +336,11 @@ def check_url_virustotal(url, api_key):
     return {"status": "error", "message": f"VirusTotal returned HTTP {resp.status_code}."}
 
 
-def print_report(headers, auth_results, mismatch_result, urls, sender_domain, domain_age, lookalike_warnings,
-                  llm_result, llm_error, url_reports):
-    """Print a structured report."""
-    print("=" * 60)
-    print("EMAIL SECURITY ANALYSIS REPORT")
-    print("=" * 60)
-
-    print("\n[Basic Headers]")
-    print(f"From: {headers['From']}")
-    print(f"Reply-To: {headers['Reply-To']}")
-    print(f"To: {headers['To']}")
-    print(f"Subject: {headers['Subject']}")
-    print(f"Date: {headers['Date']}")
-    print(f"Message-ID: {headers['Message-ID']}")
-    print(f"Return-Path: {headers['Return-Path']}")
-
-    print("\n[Authentication Results]")
-    print(f"SPF: {auth_results['SPF']}")
-    print(f"DKIM: {auth_results['DKIM']}")
-    print(f"DMARC: {auth_results['DMARC']}")
-
-    print("\n[From vs Reply-To Check]")
-    mismatch_found, mismatch_message = mismatch_result
-    print(f"Mismatch Found: {'YES' if mismatch_found else 'NO'}")
-    print(f"Details: {mismatch_message}")
-
-    print("\n[Sender Domain]")
-    print(f"Sender domain: {sender_domain}")
-
-    print("\n[Domain Age]")
-    age_days, age_message = domain_age
-    print(f"Age in days: {age_days}")
-    print(f"Details: {age_message}")
-
-    print("\n[Lookalike Domain Check]")
-    if lookalike_warnings:
-        for warning in lookalike_warnings:
-            print(f"WARNING: {warning}")
-    else:
-        print("No lookalike domain warning found.")
-
-    print("\n[URLs Found]")
-    if urls:
-        for url in urls:
-            print(f"- {url}")
-    else:
-        print("No URLs found.")
-
-    print("\n[LLM Analysis]")
-    if llm_error:
-        print(llm_error)
-    elif llm_result:
-        print(f"Urgency/Fear Tactics: {'YES' if llm_result['urgency_or_fear_tactics'] else 'NO'}")
-        print(f"Impersonation: {'YES' if llm_result['impersonation'] else 'NO'}")
-        print(f"Authority Pressure: {'YES' if llm_result['authority_pressure'] else 'NO'}")
-        print(f"Requests Credentials/Action: {'YES' if llm_result['requests_credentials_or_action'] else 'NO'}")
-        print(f"Summary: {llm_result['summary']}")
-
-    print("\n[VirusTotal URL Checks]")
-    if not url_reports:
-        print("No URLs to check.")
-    else:
-        for url, report in url_reports:
-            status = report["status"]
-            if status == "found":
-                print(f"- {url}: {report['malicious']}/{report['total_engines']} engines flagged malicious")
-            elif status == "not_scanned":
-                print(f"- {url}: not previously scanned by VirusTotal; submitted for analysis")
-            elif status == "skipped":
-                print(f"- {url}: skipped (VIRUSTOTAL_API_KEY not set)")
-            else:
-                print(f"- {url}: error - {report['message']}")
-
-    print("\n[Quick Risk Notes]")
+def build_risk_notes(headers, auth_results, mismatch_result, domain_age, lookalike_warnings,
+                     llm_result, url_reports):
+    """Collect human-readable risk signals from analysis results."""
+    mismatch_found, _ = mismatch_result
+    age_days, _ = domain_age
     risk_notes = []
 
     if mismatch_found:
@@ -439,11 +370,188 @@ def print_report(headers, auth_results, mismatch_result, urls, sender_domain, do
             "requests_credentials_or_action",
         )
     ):
-        risk_notes.append("LLM detected social engineering tactics (see LLM Analysis).")
+        risk_notes.append("LLM detected social engineering tactics.")
 
     if any(report.get("malicious", 0) > 0 for _, report in url_reports):
         risk_notes.append("VirusTotal flagged a malicious URL.")
 
+    return risk_notes
+
+
+def analyze_message(msg, progress_callback=None):
+    """Run full analysis on a parsed email message and return structured results."""
+    headers = get_basic_headers(msg)
+
+    from_header = headers["From"]
+    reply_to_header = headers["Reply-To"]
+    sender_domain = extract_email_domain(from_header)
+    mismatch_result = check_from_reply_to_mismatch(from_header, reply_to_header)
+
+    plain_text, html_text = extract_body(msg)
+
+    urls = []
+    urls.extend(extract_urls_from_text(plain_text))
+    urls.extend(extract_urls_from_text(html_text))
+    urls.extend(extract_urls_from_html(html_text))
+    urls = sorted(set(urls))
+
+    auth_results = parse_authentication_results(
+        headers["Authentication-Results"],
+        headers["Received-SPF"],
+    )
+
+    registered_sender_domain = get_registered_domain(sender_domain)
+    domain_age = get_domain_age(registered_sender_domain) if registered_sender_domain else (
+        "unknown",
+        "No sender domain found.",
+    )
+    lookalike_warnings = check_lookalike_domain(registered_sender_domain)
+    llm_result, llm_error = analyze_with_llm(headers["Subject"], plain_text, html_text)
+
+    vt_api_key = os.environ.get("VIRUSTOTAL_API_KEY")
+    url_reports = []
+    if vt_api_key:
+        for i, url in enumerate(urls):
+            if i > 0:
+                time.sleep(16)
+            if progress_callback:
+                progress_callback(i + 1, len(urls), url)
+            url_reports.append((url, check_url_virustotal(url, vt_api_key)))
+    else:
+        url_reports = [(url, {"status": "skipped"}) for url in urls]
+
+    age_days, age_message = domain_age
+    mismatch_found, mismatch_message = mismatch_result
+
+    return {
+        "headers": headers,
+        "auth_results": auth_results,
+        "mismatch": {
+            "found": mismatch_found,
+            "message": mismatch_message,
+        },
+        "sender_domain": registered_sender_domain,
+        "domain_age": {
+            "days": age_days,
+            "message": age_message,
+        },
+        "lookalike_warnings": lookalike_warnings,
+        "urls": urls,
+        "llm": {
+            "result": llm_result,
+            "error": llm_error,
+        },
+        "url_reports": [
+            {"url": url, "report": report}
+            for url, report in url_reports
+        ],
+        "risk_notes": build_risk_notes(
+            headers,
+            auth_results,
+            mismatch_result,
+            domain_age,
+            lookalike_warnings,
+            llm_result,
+            url_reports,
+        ),
+    }
+
+
+def analyze_eml_bytes(data):
+    """Parse raw .eml bytes and return analysis results."""
+    msg = BytesParser(policy=policy.default).parsebytes(data)
+    return analyze_message(msg)
+
+
+def analyze_eml_file(file_path):
+    """Load an .eml file from disk and return analysis results."""
+    msg = load_email(file_path)
+    return analyze_message(msg)
+
+
+def print_report(report):
+    """Print a structured report from analysis results."""
+    headers = report["headers"]
+    auth_results = report["auth_results"]
+    mismatch = report["mismatch"]
+    sender_domain = report["sender_domain"]
+    domain_age = report["domain_age"]
+    lookalike_warnings = report["lookalike_warnings"]
+    urls = report["urls"]
+    llm_result = report["llm"]["result"]
+    llm_error = report["llm"]["error"]
+    url_reports = [(item["url"], item["report"]) for item in report["url_reports"]]
+    risk_notes = report["risk_notes"]
+
+    print("=" * 60)
+    print("EMAIL SECURITY ANALYSIS REPORT")
+    print("=" * 60)
+
+    print("\n[Basic Headers]")
+    print(f"From: {headers['From']}")
+    print(f"Reply-To: {headers['Reply-To']}")
+    print(f"To: {headers['To']}")
+    print(f"Subject: {headers['Subject']}")
+    print(f"Date: {headers['Date']}")
+    print(f"Message-ID: {headers['Message-ID']}")
+    print(f"Return-Path: {headers['Return-Path']}")
+
+    print("\n[Authentication Results]")
+    print(f"SPF: {auth_results['SPF']}")
+    print(f"DKIM: {auth_results['DKIM']}")
+    print(f"DMARC: {auth_results['DMARC']}")
+
+    print("\n[From vs Reply-To Check]")
+    print(f"Mismatch Found: {'YES' if mismatch['found'] else 'NO'}")
+    print(f"Details: {mismatch['message']}")
+
+    print("\n[Sender Domain]")
+    print(f"Sender domain: {sender_domain}")
+
+    print("\n[Domain Age]")
+    print(f"Age in days: {domain_age['days']}")
+    print(f"Details: {domain_age['message']}")
+
+    print("\n[Lookalike Domain Check]")
+    if lookalike_warnings:
+        for warning in lookalike_warnings:
+            print(f"WARNING: {warning}")
+    else:
+        print("No lookalike domain warning found.")
+
+    print("\n[URLs Found]")
+    if urls:
+        for url in urls:
+            print(f"- {url}")
+    else:
+        print("No URLs found.")
+
+    print("\n[LLM Analysis]")
+    if llm_error:
+        print(llm_error)
+    elif llm_result:
+        print(f"Urgency/Fear Tactics: {'YES' if llm_result['urgency_or_fear_tactics'] else 'NO'}")
+        print(f"Impersonation: {'YES' if llm_result['impersonation'] else 'NO'}")
+        print(f"Authority Pressure: {'YES' if llm_result['authority_pressure'] else 'NO'}")
+        print(f"Requests Credentials/Action: {'YES' if llm_result['requests_credentials_or_action'] else 'NO'}")
+        print(f"Summary: {llm_result['summary']}")
+
+    print("\n[VirusTotal URL Checks]")
+    if not url_reports:
+        print("No URLs to check.")
+    else:
+        for url, vt_report in url_reports:
+            status = vt_report["status"]
+            if status == "found":
+                print(f"- {url}: {vt_report['malicious']}/{vt_report['total_engines']} engines flagged malicious")
+            elif status == "not_scanned":
+                print(f"- {url}: not previously scanned by VirusTotal; submitted for analysis")
+            elif status == "skipped":
+                print(f"- {url}: skipped (VIRUSTOTAL_API_KEY not set)")
+            else:
+                print(f"- {url}: error - {vt_report['message']}")
+
+    print("\n[Quick Risk Notes]")
     if risk_notes:
         for note in risk_notes:
             print(f"- {note}")
@@ -459,67 +567,8 @@ def main():
         sys.exit(1)
 
     file_path = sys.argv[1]
-
-    msg = load_email(file_path)
-    headers = get_basic_headers(msg)
-
-    from_header = headers["From"]
-    reply_to_header = headers["Reply-To"]
-
-    sender_domain = extract_email_domain(from_header)
-
-    mismatch_result = check_from_reply_to_mismatch(from_header, reply_to_header)
-
-    plain_text, html_text = extract_body(msg)
-
-    urls = []
-    urls.extend(extract_urls_from_text(plain_text))
-    urls.extend(extract_urls_from_text(html_text))
-    urls.extend(extract_urls_from_html(html_text))
-
-    # Remove duplicate URLs
-    urls = sorted(set(urls))
-
-    auth_results = parse_authentication_results(
-        headers["Authentication-Results"],
-        headers["Received-SPF"]
-    )
-
-    registered_sender_domain = get_registered_domain(sender_domain)
-
-    domain_age = get_domain_age(registered_sender_domain) if registered_sender_domain else (
-        "unknown",
-        "No sender domain found."
-    )
-
-    lookalike_warnings = check_lookalike_domain(registered_sender_domain)
-
-    llm_result, llm_error = analyze_with_llm(headers["Subject"], plain_text, html_text)
-
-    vt_api_key = os.environ.get("VIRUSTOTAL_API_KEY")
-    url_reports = []
-    if vt_api_key:
-        if len(urls) > 1:
-            print(f"Checking {len(urls)} URLs against VirusTotal (free-tier rate limit, ~16s between requests)...")
-        for i, url in enumerate(urls):
-            if i > 0:
-                time.sleep(16)
-            url_reports.append((url, check_url_virustotal(url, vt_api_key)))
-    else:
-        url_reports = [(url, {"status": "skipped"}) for url in urls]
-
-    print_report(
-        headers=headers,
-        auth_results=auth_results,
-        mismatch_result=mismatch_result,
-        urls=urls,
-        sender_domain=registered_sender_domain,
-        domain_age=domain_age,
-        lookalike_warnings=lookalike_warnings,
-        llm_result=llm_result,
-        llm_error=llm_error,
-        url_reports=url_reports
-    )
+    report = analyze_eml_file(file_path)
+    print_report(report)
 
 
 if __name__ == "__main__":
